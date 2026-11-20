@@ -14,8 +14,23 @@
 #
 # 09-Feb-2016   Brendan Gregg   Created this.
 
+import argparse
 from bcc import BPF
 from time import strftime
+
+# arguments
+examples = """examples:
+    ./oomkill           # trace OOM kills
+    ./oomkill -s        # trace OOM kills and print victim user stack trace
+"""
+parser = argparse.ArgumentParser(
+    description="Trace the kernel out-of-memory killer",
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    epilog=examples)
+parser.add_argument(
+    "-s", "--stack", action="store_true",
+    help="print victim process user-space stack trace")
+args = parser.parse_args()
 
 # linux stats
 loadavg = "/proc/loadavg"
@@ -24,6 +39,8 @@ loadavg = "/proc/loadavg"
 bpf_text = """
 #include <uapi/linux/ptrace.h>
 #include <linux/oom.h>
+
+#define MAX_STACK_DEPTH 127
 
 struct data_t {
     u32 fpid;
@@ -36,8 +53,25 @@ struct data_t {
 
 BPF_PERF_OUTPUT(events);
 BPF_STACK_TRACE(stack_traces, 1024);
+#ifdef CAPTURE_STACK
+struct victim_data_t {
+    u32 fpid;
+    u32 tpid;
+    u64 pages;
+    u32 stack_id;
+    char fcomm[TASK_COMM_LEN];
+    char tcomm[TASK_COMM_LEN];
+    int stack_len;
+    u64 user_stack[MAX_STACK_DEPTH];
+};
+BPF_PERCPU_ARRAY(data_tmp, struct victim_data_t, 1);
+#endif
 
+#ifdef CAPTURE_STACK
+KFUNC_PROBE(oom_kill_process, struct oom_control *oc, const char *message)
+#else
 void kprobe__oom_kill_process(struct pt_regs *ctx, struct oom_control *oc, const char *message)
+#endif
 {
     struct task_struct *p = oc->chosen;
     struct data_t data = {};
@@ -49,12 +83,38 @@ void kprobe__oom_kill_process(struct pt_regs *ctx, struct oom_control *oc, const
     bpf_get_current_comm(&data.fcomm, sizeof(data.fcomm));
     bpf_probe_read_kernel(&data.tcomm, sizeof(data.tcomm), p->comm);
 
+#ifdef CAPTURE_STACK
+    int zero = 0;
+    struct victim_data_t *vdata = data_tmp.lookup(&zero);
+    if (!vdata)
+        return 0;
+
+    vdata->fpid = data.fpid;
+    vdata->tpid = data.tpid;
+    vdata->pages = data.pages;
+    vdata->stack_id = 0;
+    __builtin_memcpy(vdata->fcomm, data.fcomm, sizeof(data.fcomm));
+    __builtin_memcpy(vdata->tcomm, data.tcomm, sizeof(data.tcomm));
+    vdata->stack_len = -1;
+    if (p) {
+        vdata->stack_len = bpf_get_task_stack(p, vdata->user_stack,
+                                              sizeof(vdata->user_stack),
+                                              BPF_F_USER_STACK);
+    }
+    events.perf_submit(ctx, vdata, sizeof(*vdata));
+#else
     // Capture the user stack trace
     data.stack_id = stack_traces.get_stackid(ctx, BPF_F_USER_STACK);
 
     events.perf_submit(ctx, &data, sizeof(data));
+#endif
+    return 0;
 }
 """
+
+if args.stack:
+    bpf_text = "#define CAPTURE_STACK\n" + bpf_text
+
 
 # process event
 def print_event(cpu, data, size):
@@ -66,6 +126,18 @@ def print_event(cpu, data, size):
         event.fcomm.decode('utf-8', 'replace'), event.tpid,
         event.tcomm.decode('utf-8', 'replace'), event.pages, avgline))
 
+    if args.stack:
+        if event.stack_len > 0:
+            print("  Victim stack trace:")
+            num_frames = event.stack_len // 8
+            for i in range(num_frames):
+                addr = event.user_stack[i]
+                sym = b.sym(addr, event.tpid, show_module=True, show_offset=True)
+                print("    %s" % sym.decode('utf-8', 'replace'))
+        else:
+            print("  Failed to capture victim stack trace (%d)" % event.stack_len)
+        return
+
     # Print the stack trace if stack_id is non-negative
     if event.stack_id >= 0:
         print("  Stack trace:")
@@ -74,6 +146,7 @@ def print_event(cpu, data, size):
             print(f"    {b.sym(addr, event.tpid)}")
     else:
         print("  Failed to capture stack trace")
+
 
 # initialize BPF
 b = BPF(text=bpf_text)
